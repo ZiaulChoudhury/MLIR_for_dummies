@@ -2,6 +2,8 @@
 
 A running log of experiments, concepts, and commands learned while exploring MLIR.
 
+**Published copy:** [github.com/ZiaulChoudhury/MLIR_for_dummies](https://github.com/ZiaulChoudhury/MLIR_for_dummies) (`mlir_primer.md` in that repo). Edit here in `llvm-src` when you are in the LLVM tree; copy and push to the GitHub repo when you want the public doc updated.
+
 **How this doc grows:** After each exploration question, the answer is added in the section where it belongs (not a separate FAQ), so the narrative stays in order.
 
 **Build location:** `build/bin/`  
@@ -474,42 +476,147 @@ LLVM IR (.ll)
 
 ## 9. Experiment 5: Writing a Custom Pass
 
-**Goal:** Write a bare-bones MLIR pass that prints the names of all dialects used in a `.mlir` file.
+**Goal:** Write a bare-bones MLIR pass named `list-dialects` that prints every dialect namespace used by operations in a `.mlir` file.
 
-This section also records **Q&A clarifications** from pass exploration. New answers are inserted under the heading they belong to, not as a separate FAQ.
+Read this section top to bottom: **what a pass is** → **files and outputs** → **code walkthrough** → **questions asked**.
 
-### End-to-end flow
+---
+
+### 9.1 What is an MLIR pass?
+
+An **MLIR pass** is a unit of work the **pass manager** runs over **MLIR IR** (a tree of **operations** in SSA form). Each pass is a C++ class with a `runOnOperation()` method. The manager decides *when* to run it; your code decides *what* to do to (or with) the IR.
+
+| Idea | Meaning |
+|------|---------|
+| **Input** | An in-memory `ModuleOp` (and everything nested under it) parsed from a `.mlir` file |
+| **Anchor op** | The pass is typed on one op kind (here `module`). `getOperation()` returns that instance |
+| **Transform pass** | Rewrites IR (replace ops, erase ops, insert ops) — e.g. lowering `tadd.add` in §11 |
+| **Analysis pass** | Inspects IR and reports; may not change the module — **`list-dialects` is analysis** |
+
+Passes are invoked from a **driver** (`mlir-opt`, `mlir-playground-opt`, `tadd-opt`) via the CLI flag **`-<pass-argument>`** (here `-list-dialects`). `MlirOptMain` parses the file, builds a `PassManager`, runs the requested passes, then **prints the module again** unless you only emit side output (like our dialect list on `llvm::outs`).
+
+**What does the pass “work on”?** Not on the text file directly — on the **operation graph**:
 
 ```text
-.mlir file → driver (mlir-playground-opt) → parse IR → PassManager runs -list-dialects
-  → runOnOperation() on the anchored op → (optional) print IR again
+module                          ← ListDialectsPass anchored here (ModuleOp)
+  func.func @main               ← func dialect
+    arith.constant              ← arith dialect
+    arith.addi
+    func.return
 ```
 
-Layers: **pass** (`ListDialectsPass.cpp`) → **registration** (`PassRegistration`) → **driver** (`MlirOptMain`) → **CMake** (library + executable).
+`list-dialects` runs **once** on the `module`, then **walks** all nested ops to see which **dialect** owns each op (`arith`, `func`, `builtin`, …).
 
-### Project layout
+---
+
+### 9.2 Project layout (every file)
 
 ```
 mlirplayground/
-├── CMakeLists.txt
+├── CMakeLists.txt                 # external project root (includes, subdirs)
 ├── lib/
-│   ├── CMakeLists.txt
-│   └── ListDialectsPass.cpp    # the pass
+│   ├── CMakeLists.txt             # builds pass library
+│   └── ListDialectsPass.cpp       # pass implementation + registration
 └── tools/
-    ├── CMakeLists.txt
-    └── mlir-playground-opt.cpp # mlir-opt-like driver
+    ├── CMakeLists.txt             # builds driver executable
+    └── mlir-playground-opt.cpp    # main(): register pass + MlirOptMain
 ```
 
-### The pass (`lib/ListDialectsPass.cpp`)
+| File | Role |
+|------|------|
+| `mlirplayground/CMakeLists.txt` | When nested in the LLVM tree, sets MLIR include paths and adds `lib/` + `tools/`. Standalone build uses `find_package(MLIR)`. |
+| `lib/CMakeLists.txt` | Defines `MLIRPlaygroundPasses` from `ListDialectsPass.cpp`; links `MLIRIR`, `MLIRPass`, `MLIRSupport`. |
+| `lib/ListDialectsPass.cpp` | Pass class, `runOnOperation()`, `registerListDialectsPass()`. |
+| `tools/CMakeLists.txt` | Builds `mlir-playground-opt`, links `MLIROptLib`, `MLIRPlaygroundPasses`, and all dialect libs (for parsing). |
+| `tools/mlir-playground-opt.cpp` | Registers the pass and dialects, calls `MlirOptMain`. |
 
-Key pieces:
+**Input file for experiments:** `simple.mlir` at the repo root (scalar `func` + `arith`).
 
-1. **Pass class** — `PassWrapper<ListDialectsPass, OperationPass<ModuleOp>>`
-2. `getArgument()` — CLI name: `-list-dialects`
-3. `runOnOperation()` — walk all ops, collect dialect namespaces
-4. `registerListDialectsPass()` — registers the pass with mlir-opt machinery
+---
+
+### 9.3 Build outputs (artifacts)
+
+After configuring LLVM with `LLVM_EXTERNAL_PROJECTS=mlirplayground`:
+
+| Output | Path (typical) | What it is |
+|--------|----------------|------------|
+| Pass library | `build/lib/libMLIRPlaygroundPasses.a` (or `.dylib`) | Object code for `ListDialectsPass` |
+| Driver | `build/bin/mlir-playground-opt` | Executable: parse `.mlir`, run passes, print IR |
+
+```bash
+cmake -S llvm -B build \
+  -DLLVM_EXTERNAL_PROJECTS=mlirplayground \
+  -DLLVM_EXTERNAL_MLIRPLAYGROUND_SOURCE_DIR=$PWD/mlirplayground
+
+ninja -C build mlir-playground-opt
+```
+
+No TableGen and no generated `.inc` files for this experiment — only C++ compile and link.
+
+---
+
+### 9.4 Runtime flow and every kind of output
+
+```text
+simple.mlir
+  → mlir-playground-opt (argv: file, -list-dialects)
+  → parse into ModuleOp (dialects must be registered)
+  → PassManager runs ListDialectsPass on module
+  → runOnOperation(): walk ops, print dialect list to stdout
+  → MlirOptMain prints the (unchanged) module to stdout
+```
+
+**1. Pass side output** (analysis text on **stdout**, from `llvm::outs` inside the pass):
+
+```bash
+build/bin/mlir-playground-opt simple.mlir -list-dialects
+```
+
+```
+Dialects used (3):
+  - arith
+  - builtin
+  - func
+```
+
+(Order is **sorted** alphabetically in the current source.)
+
+**2. MLIR IR output** (same run): after the pass, the driver still prints the **module** (unchanged IR). You will see the full `module { func.func @main ... }` after the dialect list unless you redirect or use `-o`.
+
+**3. Help output** (no input file required for listing passes):
+
+```bash
+build/bin/mlir-playground-opt --help
+```
+
+Includes a line for `list-dialects` from `getDescription()`.
+
+**4. No output file** unless you pass **`-o path.mlir`** — then the **printed IR** goes to that file; the dialect list still goes to stdout.
+
+---
+
+### 9.5 Pass code: `ListDialectsPass.cpp` line by line
+
+Full source as in the tree:
 
 ```cpp
+//===- ListDialectsPass.cpp - Print dialects used in a module -------------===//
+//
+// Skeleton MLIR pass: walks the IR and prints each dialect namespace that
+// appears in at least one operation.
+//
+//===----------------------------------------------------------------------===//
+
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Pass/Pass.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/raw_ostream.h"
+
+using namespace mlir;
+
+namespace {
+
 struct ListDialectsPass
     : public PassWrapper<ListDialectsPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ListDialectsPass)
@@ -524,76 +631,109 @@ struct ListDialectsPass
     getOperation().walk([&](Operation *op) {
       dialectNames.insert(op->getDialect()->getNamespace());
     });
+
     llvm::outs() << "Dialects used (" << dialectNames.size() << "):\n";
+    SmallVector<StringRef> sortedNames;
     for (const auto &entry : dialectNames)
-      llvm::outs() << "  - " << entry.getKey() << "\n";
+      sortedNames.push_back(entry.getKey());
+    llvm::sort(sortedNames);
+    for (StringRef name : sortedNames)
+      llvm::outs() << "  - " << name << "\n";
   }
 };
+
+} // namespace
+
+namespace mlir {
+void registerListDialectsPass() { PassRegistration<ListDialectsPass>(); }
+} // namespace mlir
 ```
 
-#### What is `PassWrapper`?
+| Lines | What they do |
+|-------|----------------|
+| 8–12 | **Includes.** `BuiltinOps.h` → `ModuleOp`. `Pass.h` → `PassWrapper`, `OperationPass`, `PassRegistration`. LLVM headers for set, sort, `llvm::outs`. |
+| 14 | `using namespace mlir` for brevity in the pass body. |
+| 16 | Anonymous namespace — pass struct is file-local; only `registerListDialectsPass` is exported. |
+| 18–19 | **Pass class** inherits `PassWrapper<ListDialectsPass, OperationPass<ModuleOp>>`: hand-written pass, anchored on **`module`**. |
+| 20 | `MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID` — RTTI id for the pass (required by current MLIR pass infra). |
+| 22 | `getArgument()` → CLI flag **`-list-dialects`** (no `list-dialects` prefix in the string). |
+| 23–25 | `getDescription()` → text in `--help`. |
+| 27–40 | **`runOnOperation()`** — body runs with `getOperation()` equal to the current `ModuleOp`. |
+| 28 | `StringSet` stores unique dialect namespace strings. |
+| 29–31 | **`.walk`**: preorder visit of every op under the module; insert `op->getDialect()->getNamespace()`. |
+| 33 | Print header and count. |
+| 34–37 | Copy set keys into `SmallVector` and **sort** for stable output. |
+| 38–39 | Print one line per dialect. |
+| 43 | Close anonymous namespace. |
+| 45–47 | **`registerListDialectsPass`**: `PassRegistration<ListDialectsPass>()` registers the pass globally so `MlirOptMain` can find `-list-dialects`. Must be called from `main` before parsing. |
 
-MLIR’s template base for a **hand-written** pass (no TableGen). You subclass `PassWrapper<YourPass, OperationPass<...>>` and implement `getArgument()`, `getDescription()`, and `runOnOperation()`. It hooks your class into the pass manager and CLI; you expose it with `PassRegistration<YourPass>()`.
+---
 
-#### What is `OperationPass`?
-
-A pass anchored on **one op type**. The pass manager calls `runOnOperation()` once per matching op in scope:
-
-| Anchor | Runs |
-|--------|------|
-| `OperationPass<ModuleOp>` | Once per `module` |
-| `OperationPass<func::FuncOp>` | Once per `func.func` |
-
-Inside `runOnOperation()`, `getOperation()` is that op. Nested ops are reached with `.walk(...)`.
-
-#### Why `ModuleOp` for `list-dialects`?
-
-A `.mlir` file is one `module`; all other ops nest under it. `OperationPass<ModuleOp>` runs **once**, then `.walk()` visits **every** op in the file — which matches “dialects used in this file.”
-
-`OperationPass<func::FuncOp>` would run per function (reasonable for function-local transforms, not ideal for whole-file inventory).
-
-### The driver (`tools/mlir-playground-opt.cpp`)
-
-A minimal `mlir-opt` that registers all dialects plus our pass:
+### 9.6 Driver: `mlir-playground-opt.cpp` line by line
 
 ```cpp
-mlir::registerListDialectsPass();
-mlir::DialectRegistry registry;
-mlir::registerAllDialects(registry);
-return mlir::asMainReturnCode(
-    mlir::MlirOptMain(argc, argv, "MLIR Playground optimizer driver\n", registry));
+#include "mlir/InitAllDialects.h"
+#include "mlir/Tools/mlir-opt/MlirOptMain.h"
+
+namespace mlir {
+void registerListDialectsPass();
+}
+
+int main(int argc, char **argv) {
+  mlir::registerListDialectsPass();
+
+  mlir::DialectRegistry registry;
+  mlir::registerAllDialects(registry);
+
+  return mlir::asMainReturnCode(mlir::MlirOptMain(
+      argc, argv, "MLIR Playground optimizer driver\n", registry));
+}
 ```
 
-Note: skip `registerAllPasses()` unless you also link all conversion/pass libraries — it causes linker errors in a minimal driver.
+| Lines | What they do |
+|-------|----------------|
+| 7–8 | Pull in dialect registration and the standard opt driver entry point. |
+| 10–12 | Forward declare our registration function (defined in the pass `.cpp` library). |
+| 15 | Register **our** pass with the global pass registry. |
+| 17–18 | Build a **dialect registry** and register **all** stock dialects so `simple.mlir` can parse (`arith`, `func`, …). |
+| 20–21 | `MlirOptMain`: parse CLI, parse input MLIR, run passes, print IR. `asMainReturnCode` maps failure to an exit code. |
 
-### Build (integrated into the LLVM tree)
+We do **not** call `registerAllPasses()` here — that pulls in hundreds of passes and **link errors** unless every conversion library is linked. We only register the one pass we need.
 
-One-time CMake reconfigure to add the external project:
+---
 
-```bash
-cmake -S llvm -B build \
-  -DLLVM_EXTERNAL_PROJECTS=mlirplayground \
-  -DLLVM_EXTERNAL_MLIRPLAYGROUND_SOURCE_DIR=$PWD/mlirplayground
+### 9.7 CMake (what each file adds)
 
-ninja -C build mlir-playground-opt
+**`lib/CMakeLists.txt`**
+
+```cmake
+add_mlir_library(MLIRPlaygroundPasses
+  ListDialectsPass.cpp
+  LINK_LIBS PUBLIC
+  MLIRIR
+  MLIRPass
+  MLIRSupport
+)
 ```
 
-### Run
+Produces **`MLIRPlaygroundPasses`** containing the pass and `registerListDialectsPass`.
 
-```bash
-build/bin/mlir-playground-opt simple.mlir -list-dialects
+**`tools/CMakeLists.txt`**
+
+```cmake
+add_llvm_executable(mlir-playground-opt mlir-playground-opt.cpp)
+target_link_libraries(mlir-playground-opt PRIVATE
+  MLIROptLib
+  MLIRPlaygroundPasses
+  ${dialect_libs}
+)
 ```
 
-**Expected output on** `simple.mlir`**:**
+Links the driver to the pass library and dialect libs so parsing works.
 
-```
-Dialects used (3):
-  - arith
-  - builtin
-  - func
-```
+---
 
-### Anatomy of an MLIR pass
+### 9.8 Quick reference (pass anatomy)
 
 | Piece | Role |
 |-------|------|
@@ -602,14 +742,40 @@ Dialects used (3):
 | `getDescription()` | Shown in `--help` |
 | `runOnOperation()` | Your logic; `getOperation()` is the current root op |
 | `getOperation().walk(...)` | Visit every nested operation under the anchored op |
-| `PassRegistration<>` | Makes the pass discoverable by mlir-opt / MlirOptMain |
+| `PassRegistration<>` | Makes the pass discoverable by `MlirOptMain` |
 
-### Next steps for pass writing
+---
 
-- Add TableGen (`Passes.td`) when you need pass options or pipeline integration
-- Use `PassWrapper<..., OperationPass<func::FuncOp>>` to run per-function
-- See `mlir/test/lib/IR/TestPrintDefUse.cpp` for more inspection patterns
-- See `mlir/examples/standalone/` for a full out-of-tree dialect + pass project
+### 9.9 Questions asked (from exploration)
+
+**What is `PassWrapper`?**  
+MLIR’s template base for a **hand-written** pass (no TableGen `Passes.td`). You subclass `PassWrapper<YourPass, OperationPass<...>>`, implement `getArgument()`, `getDescription()`, and `runOnOperation()`, and expose it with `PassRegistration<YourPass>()`.
+
+**What is `OperationPass`?**  
+A pass anchored on **one op type**. The pass manager calls `runOnOperation()` once per matching op in scope:
+
+| Anchor | Runs |
+|--------|------|
+| `OperationPass<ModuleOp>` | Once per top-level `module` |
+| `OperationPass<func::FuncOp>` | Once per `func.func` |
+
+Nested ops are reached with `.walk()` (or explicit region iteration), not by choosing a different anchor for every op kind.
+
+**Why `ModuleOp` for `list-dialects`?**  
+A single-file example is one `module`; all ops nest under it. One module pass + `.walk()` matches “dialects used in this file.” A `func::FuncOp` pass would run per function — fine for per-function transforms, awkward for a whole-file inventory.
+
+**Why not `registerAllPasses()` in the driver?**  
+It registers every upstream pass but requires linking all corresponding libraries. For a minimal playground driver, register only `registerListDialectsPass()`.
+
+**Does this pass change the IR?**  
+No. It only reads via `walk` and prints. The printed MLIR after the run is the same module (aside from normal round-trip naming).
+
+**Next steps for pass writing**
+
+- TableGen `Passes.td` when you need pass options or pipeline YAML integration
+- `OperationPass<func::FuncOp>` for per-function lowering (see `tadd-lower-to-linalg` in §11)
+- `mlir/test/lib/IR/TestPrintDefUse.cpp` — more inspection patterns
+- `mlir/examples/standalone/` — full out-of-tree dialect + pass project
 
 ---
 
@@ -1191,4 +1357,4 @@ For general pass anatomy (`PassWrapper`, `OperationPass`, registration), see [§
 
 ---
 
-*Last updated: 2026-10-22 (§11:* `matchAndRewrite` *override note)*
+*Last updated: 2026-10-25 (§9 restructured: pass basics, files/outputs, line-by-line, Q&A)*
